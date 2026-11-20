@@ -1,0 +1,125 @@
+name: fork-build
+
+# Fork-local build: the Windows runtime (dalvikvm.exe, gesher-exec.exe, the
+# compat DLLs) plus the framework assets, on standard hosted runners.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LLVM_MINGW_TAG: "20261006"
+  LLVM_MINGW_NAME: llvm-mingw-20261006-ucrt-ubuntu-22.04-x86_64
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-build
+        with:
+          ccache-key: runtime
+
+      - name: Configure query/capture-off production build
+        run: |
+          cmake -S . -B out -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-llvm-mingw.cmake \
+            -DLLVM_MINGW="$HOME/toolchain/$LLVM_MINGW_NAME" \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DGESHER_WEB3_QUERY_TESTS=OFF -DGESHER_CAPTURE_TEST_SOURCES=OFF
+
+      - name: Build everything
+        run: |
+          set +e
+          ninja -C out -k 0 > build.log 2>&1
+          code=$?
+          ccache --show-stats | head -12
+          echo "---- tail ----"
+          tail -20 build.log
+          if [[ $code != 0 ]]; then
+            echo "::group::Failed edges"
+            grep -E '^FAILED: ' build.log | sed -E 's/ -o .*//' | head -60
+            echo "::endgroup::"
+            echo "::group::First errors"
+            grep -B2 -A12 'error:' build.log | head -600
+            echo "::endgroup::"
+            exit $code
+          fi
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp out/*.exe dist/ 2>/dev/null || true
+          cp out/*.dll dist/ 2>/dev/null || true
+          cp out/*.so dist/ 2>/dev/null || true
+          cp out/dalvikvm.map out/dex2oat.map dist/ 2>/dev/null || true
+          ls -la dist | head -80
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+  framework-assets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache AOSP sources
+        uses: actions/cache@v4
+        with:
+          path: third_party/aosp
+          key: aosp-${{ hashFiles('aosp.lock', 'patches/**') }}
+          restore-keys: aosp-
+
+      - name: Fetch AOSP sources
+        run: tools/fetch-aosp.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build test apps
+        run: tests/build-test-apps.sh out/test-apps
+
+      - name: Build boot class path (core-oj, core-libart)
+        run: tools/build-boot-jars.sh out/boot-jars
+
+      - name: Build the framework's resources (framework-res.apk)
+        run: tools/build-framework-res.sh out/framework-res
+
+      - name: Collect framework assets
+        run: |
+          mkdir -p framework-assets
+          cp out/test-apps/* out/boot-jars/*.jar framework-assets/
+          cp third_party/aosp/external/icu/icu4c/source/stubdata/icudt*l.dat framework-assets/
+          tools/fonts/collect-fonts.sh third_party/aosp framework-assets
+          compat/libcore/collect-tzdata.sh third_party/aosp framework-assets
+          tools/net/collect.sh third_party/aosp framework-assets
+          cp out/framework-res/*.apk framework-assets/ 2>/dev/null || true
+          ls -la framework-assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: framework-assets
+          path: framework-assets/
+          if-no-files-found: error
